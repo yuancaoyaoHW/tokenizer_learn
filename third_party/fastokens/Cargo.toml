@@ -1,0 +1,74 @@
+[workspace]
+members = [".", "python"]
+
+[workspace.package]
+version = "0.3.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Atero-ai/fastokens"
+homepage = "https://github.com/Atero-ai/fastokens"
+documentation = "https://github.com/Atero-ai/fastokens/blob/main/README.md"
+
+[package]
+name = "fastokens"
+version.workspace = true
+edition.workspace = true
+description = "Fast Tokenizer"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[features]
+default = ["hf-hub"]
+hf-hub = ["dep:hf-hub", "dep:ureq"]
+
+[dependencies]
+daachorse = "1.0.0"
+fancy-regex = "0.17.0"
+memchr = "2"
+pcre2 = "0.2"
+regex-syntax = "0.8"
+hf-hub = { version = "0.4.3", optional = true, default-features = false, features = ["rustls-tls", "ureq"] }
+# Only to classify an `ApiError::RequestError` as a 404 (see `Error::is_not_found`).
+# `hf-hub` already pulls this in; the version must stay unified with its `ureq = "2"`
+# so the error types are the same type.
+ureq = { version = "2", optional = true, default-features = false }
+rayon = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+strum = { version = "0.27.2", features = ["derive"] }
+thiserror = "2.0.18"
+icu_normalizer = "2"
+
+# Used only to read the performance-core count (hw.perflevel0.logicalcpu) so the
+# BPE thread pool avoids scheduling on slower efficiency cores.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4.5.58", features = ["derive"] }
+csv = "1.4.0"
+indicatif = "0.18.4"
+tokenizers = { version = "0.22.2", features = ["http"] }
+
+[[example]]
+name = "get_step_kinds"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "print_pipeline"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "profile_sample"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "profile_stages"
+required-features = ["hf-hub"]
+
+[[example]]
+name = "simple_bench"
+required-features = ["hf-hub"]

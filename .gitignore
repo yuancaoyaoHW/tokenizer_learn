@@ -1,5 +1,5 @@
-# Upstream shallow clones (pin SHAs in README; not vendored)
-third_party/
+# Local leftover git dirs after vendoring third_party snapshots
+**/.git.upstream/
 
 # Python
 .venv/
