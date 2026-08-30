@@ -1,0 +1,4 @@
+{
+  "name": "tokenizer_learn",
+  "install": "bash .cursor/install.sh"
+}
