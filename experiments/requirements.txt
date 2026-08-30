@@ -1,0 +1,9 @@
+# CPU 微基准硬依赖。不包含 vLLM / SGLang / torch（那些给可选 GPU serving bench）。
+transformers
+tokenizers
+tiktoken
+jinja2
+
+# 可选更快的 BPE 后端（vLLM VLLM_USE_FASTOKENS=1 / SGLang --tokenizer-backend fastokens）。
+# 未安装时 bench_backends.py 会 SKIP，不失败。
+# fastokens>=0.2.0
