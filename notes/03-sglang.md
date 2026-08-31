@@ -600,6 +600,8 @@ HTTP generate_request
 
 ## 5. `get_tokenizer` 与 `--tokenizer-backend`
 
+探测链（`.json` / GGUF / tekken / AutoTokenizer）、v5 加载后修复、和 vLLM 注册表的对照见 [07-tokenizer-dispatch.md](07-tokenizer-dispatch.md)。下面只留本篇跟一条请求还要用的入口和 fastokens 开关。
+
 兼容入口：
 
 ```14:17:third_party/sglang/python/sglang/srt/utils/hf_transformers_utils.py
