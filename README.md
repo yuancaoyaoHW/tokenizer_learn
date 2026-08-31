@@ -93,10 +93,10 @@ tokenizer/
 | --- | --- | --- |
 | [notes/00-fundamentals.md](notes/00-fundamentals.md) | 已写 | BPE/BBPE；minbpe `basic.py` → `regex.py`；special tokens；serving 三段式 |
 | [notes/01-hf-tokenizers.md](notes/01-hf-tokenizers.md) | 已写 | HF pipeline；DecodeStream；slow vs fast；tiktoken vs HF；`Already borrowed`；fastokens |
-| [notes/02-vllm.md](notes/02-vllm.md) | 计划 | Renderer → tokenizer pool → FastIncrementalDetokenizer |
-| [notes/03-sglang.md](notes/03-sglang.md) | 计划 | TokenizerManager / DetokenizerManager / 多 worker IPC |
-| [notes/04-compare.md](notes/04-compare.md) | 计划 | vLLM vs SGLang |
-| [notes/05-performance.md](notes/05-performance.md) | 计划 | 指标、瓶颈、怎么跑到最好 |
+| [notes/02-vllm.md](notes/02-vllm.md) | 已写 | Renderer 四步流水线 → tokenizer pool → Fast/Slow IncrementalDetokenizer |
+| [notes/03-sglang.md](notes/03-sglang.md) | 已写 | TokenizerManager / DetokenizerManager / 多 worker IPC |
+| [notes/04-compare.md](notes/04-compare.md) | 已写 | vLLM vs SGLang |
+| [notes/05-performance.md](notes/05-performance.md) | 已写 | 指标、瓶颈、怎么跑到最好 |
 
 ---
 

@@ -219,9 +219,83 @@ OpenAI Chat 在 **同一主进程** 的 `OpenAIServingChat` 里先渲染再 enco
                 )
 ```
 
-文本路径走 `_tokenize_texts`：fast tokenizer 用 `__call__` 一次 batch；slow tokenizer 退回逐条 `encode`。可选 `--enable-dynamic-batch-tokenizer` 把并发单条 encode 攒进 `AsyncDynamicbatchTokenizer`（内部单线程 `ThreadPoolExecutor`，避免堵 event loop）。`--enable-tokenizer-batch-encode` 则在 `_handle_batch_request` 里对一个 HTTP batch 做一次 `batch_decode` 风格的 batch encode。
+`_tokenize_texts` 先识别输入形状，再决定走哪条 encode：
 
-tokenize 完后 `_create_tokenized_object` 打成 `TokenizedGenerateReqInput`（`io_struct.py` L966）：`input_ids` 是 `array("q", ...)`，带上 `sampling_params`、`stream`、`rid`、`http_worker_ipc`。
+| `InputFormat` | 形状 | 喂给 tokenizer 的东西 |
+| --- | --- | --- |
+| `SINGLE_STRING` | `"Hello"` | 包成 `[text]`，单条时可走动态攒批 |
+| `BATCH_STRINGS` | `["Hello", "World"]` | 原样 batch encode |
+| `CROSS_ENCODER_PAIRS` | `[["query", "doc"]]` | 原样；并打开 `return_token_type_ids` |
+
+```889:937:third_party/sglang/python/sglang/srt/managers/tokenizer_manager.py
+    async def _tokenize_texts(...):
+        input_format = self._detect_input_format(texts, is_cross_encoder)
+        tokenizer_input = self._prepare_tokenizer_input(texts, input_format)
+        ...
+        use_async_tokenizer = (
+            self.async_dynamic_batch_tokenizer is not None
+            and input_format == InputFormat.SINGLE_STRING
+        )
+        if use_async_tokenizer:
+            result = await self.async_dynamic_batch_tokenizer.encode(
+                tokenizer_input[0], **tokenizer_kwargs
+            )
+            ...
+        else:
+            if not is_cross_encoder and (not getattr(self.tokenizer, "is_fast", False)):
+                input_ids = [self.tokenizer.encode(t) for t in tokenizer_input]
+            else:
+                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+```
+
+设计点：
+
+- **slow tokenizer 不用 `__call__`**，逐条 `encode`，避开 HF slow 路径上不兼容的 kwargs。
+- **`--enable-dynamic-batch-tokenizer`** 只接单字符串。并发请求进 `AsyncDynamicbatchTokenizer` 队列，在 `batch_wait_timeout_s`（默认 2ms）内攒到 `max_batch_size`，kwargs 完全一致才一次 `tokenizer(prompts, **kwargs)`；否则退回逐条。真正的 HF 调用丢进 **单线程** `ThreadPoolExecutor`，event loop 不被 GIL 堵住。
+- EmbeddingGemma：checkpoint 默认加 BOS 不加 EOS。这里按条补 `eos_token_id`，不改 tokenizer 全局 post-processor。
+- `--enable-tokenizer-batch-encode` 在 `_handle_batch_request` 里对一个 HTTP batch 做一次 `tokenizer(list_of_texts)`。约束：不能有多模态、不能混 `input_ids` / `input_embeds`。全是预 tokenize 的 ids 时也会 **batch 发送**（不再 encode），但 **DP attention 时关掉**，否则会全打到 rank 0。
+
+```1541:1555:third_party/sglang/python/sglang/srt/managers/tokenizer_manager.py
+    def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
+        return batch_size > 0 and (
+            get_serving().enable_tokenizer_batch_encode
+            or (
+                (not get_parallel().enable_dp_attention)
+                and (not self._batch_has_text(batch_size, requests))
+            )
+        )
+```
+
+### 1.4.1 多模态：`input_ids` 以 mm_processor 为准
+
+有 `image_data` / `audio_data` / `video_data`（或 MossVL）时，文本 encode 只是起点：
+
+1. 纯音频（Whisper）可以 `text=""`，先放空 `input_ids`，后面由 processor 覆盖。
+2. `--language-model-only` 拒多模态。
+3. EPD（encoder 分离）：`zmq_to_tokenizer` 先从 encoder 收 embedding；拿不到才回退本地 `process_mm_data_async`。
+4. processor 返回的 `mm_inputs.input_ids` **覆盖** 文本路径的 ids（占位符已展开）。
+5. 可选 `mm_hashes`：外部 KV 路由器用内容哈希当 prefix-cache key。写进 `MultimodalDataItem` 后 `set_pad_value()` 不再自己 `hash_feature()`，路由决策和 radix cache 对齐。解析失败就回退内部哈希，不挡请求。
+
+`--skip-tokenizer-init` 时 tokenizer 为 `None`，但 **mm_processor 仍会建**，图像仍要编码。
+
+### 1.4.2 校验与打包
+
+`_validate_one_request`：输入长度（加 reserved tokens）和 `input + max_new_tokens` 都不能超过 `context_len`。`--allow-auto-truncate` 可截断 prompt 或砍 `max_new_tokens`，否则抛错。
+
+`_create_tokenized_object` 打成 `TokenizedGenerateReqInput`（`io_struct.py` L966）：`input_ids` 是 `array("q", ...)`（有符号 64-bit，兼容多模态负 placeholder id），带上 `sampling_params`、`stream`、`rid`、`http_worker_ipc`。
+
+`SamplingParams.normalize(tokenizer)` 在进 Scheduler **之前**就把 stop string encode 一遍，记下 `stop_str_max_len`。Scheduler 每步只 decode 尾巴那么长的 token 做停词匹配（`Req.tail_str`），不是全量 decode：
+
+```220:241:third_party/sglang/python/sglang/srt/sampling/sampling_params.py
+    def normalize(self, tokenizer):
+        ...
+            for stop_str in self.stop_strs:
+                if tokenizer is not None:
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+```
+
+`skip_tokenizer_init=True` 时 tokenizer 为 `None`：string `stop` / `stop_regex` / `min_new_tokens` 直接拒绝（没有 decode、没有 `eos_token_id`）。
 
 ### 1.5 ZMQ 发出去
 
@@ -461,6 +535,24 @@ byte-level BPE 一个汉字常跨多个 token。中间步 `decode` 会得到以 
 
 请求结束：`get_decoded_text() + new_text`，`trim_matched_stop` 裁 stop string / stop token，再发 `output_str[sent_offset:]`，并从 `decode_status` 删掉该 `rid`。
 
+`no_stop_trim=True` 时保留匹配到的 stop。gpt-oss 的 `<|call|>`（id `200012`）即使是 eos 也不 trim，留给 tool-call parser。
+
+### 3.5 走一遍：prompt 之后生成 `A B C`，`C` 是半个多字节字
+
+```
+decode_ids:  [prompt_tail(最多 5 个) | A | B | C]
+                          ^surr      ^read（初始 = prompt 末）
+```
+
+| 步 | `new_text` | 行为 |
+| --- | --- | --- |
+| 1 | `"He"`（干净） | 提交：`surr` 移到 A 之后，发出 `"He"` |
+| 2 | `"llo"` | 提交，发出 `"llo"` |
+| 3 | `"世�"` | **不推进** token 偏移；`find_printable_text` 若末尾是 CJK 则发 `"世"`（或等到下一 token 把 `�` 补全） |
+| 结束 | 完整串 | `trim_matched_stop`，发 `output_str[sent_offset:]` |
+
+Stop 命中时，`read_ids` 会先按 `finished_reason.matched` trim 再 decode，所以流式最后一块默认不会把 stop string 漏出去。
+
 ---
 
 ## 4. 回到 TokenizerManager，再回到客户端
@@ -480,7 +572,17 @@ TokenizerManager 的 `handle_loop` 与 HTTP handler **并发**跑在同一个 as
                 await self._handle_batch_output(recv_obj)
 ```
 
-`_handle_batch_output` 按 `rid` 找回 `ReqState`，把 `recv_obj.output_strs[i]` 当 **delta** 累进 `state.append_text`。流式 + `incremental_streaming_output` 时，chunk 的 `"text"` 就是这一步的 delta；非增量流式则中间 chunk 的 `"text"` 先填 `None`，等到 `_stream_one_response` 再 `state.get_text()`，避免每步 `O(n)` 拼整串变成 `O(n²)`。
+`_handle_batch_output` 按 `rid` 找回 `ReqState`，把 `recv_obj.output_strs[i]` 当 **delta** 累进 `state.append_text`（`text_chunks` 懒拼接，避免每步重建整串）。
+
+| 模式 | 中间 chunk | 结束 |
+| --- | --- | --- |
+| `incremental_streaming_output` | 只发本步 delta text / ids | 最后一段 delta |
+| 普通 stream | 中间 `"text": None`，yield 前再 `get_text()` | 完整 text |
+| 非 stream | 中间不 yield | 完整 text |
+
+积压超过 1 个 chunk 时 `_coalesce_streaming_chunks` 把多个 delta 拼成一个，避免 token id 丢。积压 ≥ 20 会打 warning（P99 ITL 会被抬高）。
+
+`return_text_in_logprobs` 时 TokenizerManager **自己** 给每个 logprob token 配文本：`batch_decode([[id], ...])`。transformers v5 的 `batch_decode([1, 2, 3])` 会拼成一串，所以每个 id 必须包一层 list。
 
 然后 `state.event.set()`。`_stream_one_response` 被唤醒，yield `out`。HTTP 层包成 `data: {...}\n\n`。结束时 `finished_reasons[i] is not None`，删 `rid_to_state`，再 yield 最后一包；SSE 跟 `[DONE]`。
 
@@ -546,7 +648,30 @@ def get_tokenizer(
 
 `fastokens` 路径：`fastokens.patch_transformers()` 一次性 monkey-patch，让 `TokenizersBackend.from_pretrained` 返回 fastokens shim。加载失败 **不会** 静默回退 huggingface，而是明确报错让你去掉 `--tokenizer-backend=fastokens`（L555–561）。`*.json` tiktoken 文件走自己的 `TiktokenTokenizer`，不打 patch。
 
-TokenizerManager / DetokenizerManager /（非 skip 时的）Scheduler 都会调 `get_tokenizer`，`tokenizer_backend` 从 `get_serving().tokenizer_backend` 传入，三进程后端必须一致。
+TokenizerManager / DetokenizerManager /（非 skip 时的）Scheduler 都会调 `get_tokenizer`，`tokenizer_backend` 从 `get_serving().tokenizer_backend` 传入，三进程后端必须一致。**内存上是三份 HF 对象**，不跨进程共享 Rust tokenizer。
+
+加载后还会打一批兼容补丁（`_apply_post_load_fixes`），否则 transformers v5 会静默改行为：
+
+```426:441:third_party/sglang/python/sglang/srt/utils/hf_transformers/tokenizer.py
+def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
+    _install_tokenizer_warnings_filter(tokenizer)
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
+    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
+    ...
+    patch_mistral_common_tokenizer(tokenizer)
+    _fix_special_tokens_pattern(tokenizer)
+    attach_additional_stop_token_ids(tokenizer)
+    return patch_tokenizer(tokenizer)
+```
+
+| 补丁 | 修什么 |
+| --- | --- |
+| `_fix_v5_tokenizer_components` | Llama 类 `__init__` 用类默认 pre_tokenizer/decoder 覆盖 `tokenizer.json`（DeepSeek-V3.2 实际是 ByteLevel） |
+| `_fix_v5_add_bos_eos_token` | v5 见到 `tokenizer.json` 就丢掉 `add_bos_token`；DeepSeek 一类靠 flag 加 BOS，不靠 post-processor |
+| `_fix_special_tokens_pattern` | 默认 `"cls_sep"` 会在没有 cls/sep 时往 ids 里插 `None`（Kimi TikToken） |
+| `patch_tokenizer` | 给 Kimi TikToken 缓存 `all_special_ids`（热路径反复算很贵） |
+
+`*.json` 结尾走内部 `TiktokenTokenizer`，不打 fastokens patch。GGUF / 远程 URI / 裸 `tekken.json` 各有旁路。
 
 ---
 
@@ -611,6 +736,17 @@ TokenizerManager / DetokenizerManager /（非 skip 时的）Scheduler 都会调 
 | Chat template | OpenAI serving 层（与 TokenizerManager 同进程），再交 `generate_request` | Renderer 层，同样在进 engine 之前 |
 
 两边都把「模板 / 工具 / 多模态 placeholder」和 BPE 切开；两边都支持 `skip_tokenizer_init` + 预 tokenize。差别是 **进程边界 vs 线程池副本**，不是 BPE 算法本身。
+
+---
+
+## 9. 设计上容易忽略的点
+
+1. **Chat template 不在 TokenizerManager 里。** OpenAI `/v1/chat/completions` 在 serving 层渲完（甚至直接交出 `input_ids`）之后，TokenizerManager 只看到最终字符串或 ids。
+2. **Tokenizer 加载了三份**（Tokenizer / Detokenizer / Scheduler），保证 stop 匹配、grammar、decode 用同一套词表。
+3. **GIL**：encode 可选丢线程池（dynamic batch tokenizer）；decode 必须独立进程。
+4. **Detokenizer 状态是有界 LRU**（默认 65536）。超高并发长连接要把 `SGLANG_DETOKENIZER_MAX_STATES` 调大，否则 rid 被踢下一步 500。
+5. **多 tokenizer worker 时 rid 必须全局唯一。** 每个 worker 自己的 `rid_to_state`；Detokenizer 的 `decode_status` 是全局的。health check 用前缀 + uuid，避免和时间戳 rid 撞。
+6. 若要对齐自己实现的 tokenizer，最该复刻的不是 HF 封装，而是 **Detokenizer 的 surr/read 双 decode + `�` 不提交偏移**。encode 侧相对标准，复杂点在多模态占位符和 stop string 的 `stop_str_max_len`。
 
 ---
 
