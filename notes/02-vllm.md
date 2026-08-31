@@ -66,6 +66,21 @@ vLLM 近年把 tokenizer 从「engine 里直接 encode」收成三层：
 - **EngineCore**：只吃 `prompt_token_ids`（GPU 进程）
 - **OutputProcessor**：增量 detokenize + 按 `output_kind` 组 chunk（API 进程）
 
+Tokenizer 对象本身只做 encode / decode / `apply_chat_template`。真正把一次请求串起来的是 Renderer 和 Detokenizer：
+
+| 层 | 入口 | 干什么 | 不干什么 |
+| --- | --- | --- | --- |
+| Tokenizer | `vllm/tokenizers` | `CachedHfTokenizer`：encode / decode / 模板；缓存 vocab；fast tokenizer 做 deepcopy 池 | 不管 chat 格式、截断策略、MM、stop string |
+| Renderer | `renderers/base.py` + `hf.py` | API 输入 → `EngineInput`：Jinja、tokenize、padding/truncation、MM placeholder | 不跑模型，不把生成 token 转成文本 |
+| Detokenizer | `v1/engine/detokenizer.py` | 每个新 token 增量 decode；检查 stop string；控制 streaming 缓冲 | 不 tokenize prompt；GPU 侧不可见 |
+
+`BaseRenderer` 把「tokenize」扩成四步（`render_cmpl` / `render_chat`）：
+
+1. **Render**：`render_messages` / `render_prompt`。Chat 走 Jinja 得到 `str` 或 `list[int]`；Completion 原样透传。
+2. **Tokenize**：已有 `prompt_token_ids` 则跳过。否则 `apply_pre_tokenization` → `tokenizer()` → `apply_post_tokenization`。
+3. **Extras**：`prompt_extras` 合进目标 prompt。
+4. **Engine input**：有 `multi_modal_data` 走 MM processor；纯 embeds 走 `_process_embeds`；否则 `tokens_input`。
+
 ---
 
 ## 1. HTTP：messages 进门
@@ -154,7 +169,26 @@ def safe_apply_chat_template(..., tokenize: bool = True, ...):
     )
 ```
 
-模板解析优先级在 `resolve_chat_template`：请求传入的模板 → Processor 模板 → Tokenizer 模板 → vLLM 预置 fallback。这是请求预处理，不是 vocab 操作。
+模板解析优先级在 `resolve_chat_template`：请求传入的模板 → Processor 模板（**有 tools 时跳过**，避免和 tool-calling 模板冲突）→ Tokenizer 模板 → vLLM 预置 fallback。这是请求预处理，不是 vocab 操作。
+
+`safe_apply_chat_template` 还有几处容易漏掉的兼容逻辑：
+
+- **content format** 不是靠模型名猜的。`--chat-template-content-format auto` 时解析 Jinja AST：若存在 `for item in message['content']` 这类循环则为 `openai`（多段 content），否则 `string`。
+
+```431:449:third_party/vllm/vllm/renderers/hf.py
+def _detect_content_format(chat_template: str, *, default: ...):
+    ...
+    try:
+        next(_iter_nodes_assign_content_item(jinja_ast))
+    except StopIteration:
+        return "string"
+    else:
+        return "openai"
+```
+
+- **developer 角色**：模板里没有 `"developer"` 时，把 developer 消息改成 system，并合并成第一条（Qwen 3.6 这类「system 必须在最前」的模板）。
+- **transformers v5**：`apply_chat_template(tokenize=True)` 默认 `return_dict=True`，会返回 `BatchEncoding`。vLLM 强制 `return_dict=False`，保证下游 `parse_dec_only_prompt` 拿到 `list[int]`。
+- 模板含 `{% generation %}` 且请求 `return_assistant_tokens_mask` 时，额外拿 assistant mask（SFT / 续写）。
 
 `render_chat` / `render_chat_async` 把「渲染」和「tokenize」拆成两步：
 
@@ -276,6 +310,32 @@ HTTP 热路径已经先 `render_chat_async`，所以 `AsyncLLM.add_request` 看�
         )
 ```
 
+### TokenizeParams：encode 前后两层防护
+
+真正调用 `tokenizer()` 前后，`TokenizeParams` 各做一次校验，避免无界 tokenize 和超长 prompt。
+
+Chat / Completion **默认不一样**：
+
+```351:370:third_party/vllm/vllm/renderers/base.py
+        return TokenizeParams(
+            ...
+            add_special_tokens=True,   # default_cmpl_tok_params
+        )
+        ...
+        return TokenizeParams(
+            ...
+            add_special_tokens=False,  # default_chat_tok_params：模板已经写过 BOS/EOS
+        )
+```
+
+| 阶段 | 动作 |
+| --- | --- |
+| pre（`apply_pre_tokenization`） | 字符级长度上界（`max_chars_per_token × max_input_tokens`）；可选 lower case |
+| encode（`get_encode_kwargs`） | `truncation` / `max_length` / `add_special_tokens`；fast tokenizer 可要 `offset_mapping` |
+| post（`apply_post_tokenization`） | pad、按 `truncation_side` 切片、超过 `max_input_tokens` 报 `VLLMValidationError` |
+
+指定了 `truncation_side` 时会 **关掉 tokenizer 自带 truncation**，改在 Python 侧切片，避免 HF 默认方向和请求不一致。`offset_mapping` 只在 **fast tokenizer + 纯文本、无 MM** 时开启。
+
 ---
 
 ## 4. 加载：`get_tokenizer` → CachedTokenizer
@@ -392,12 +452,22 @@ def maybe_make_thread_pool(tokenizer, copies: int = 1):
         def decode(...): ...
 ```
 
-注意两套「池」，别混：
+注意三套「池」，别混：
 
 | 池 | 解决什么 | 在哪 |
 | --- | --- | --- |
-| `ThreadPoolExecutor(max_workers=renderer_num_workers)` | 阻塞的 Jinja/encode 不堵 asyncio | `BaseRenderer.__init__` |
+| `_executor`：`ThreadPoolExecutor(max_workers=renderer_num_workers)` | 阻塞的 Jinja/encode/decode 不堵 asyncio | `BaseRenderer.__init__` |
+| `_mm_executor`：`ThreadPoolExecutor(max_workers=1)` | MM 预处理不插队 tokenize（P0/P1 顺序，见 #38418） | `BaseRenderer.__init__` |
 | `maybe_make_thread_pool(..., copies=workers+1)` | 多线程不共享同一个 Rust `RefCell` | `HfRenderer.__init__` |
+
+```82:90:third_party/vllm/vllm/renderers/base.py
+        pool_workers = config.model_config.renderer_num_workers
+        self._executor = ThreadPoolExecutor(max_workers=pool_workers)
+
+        # Separate single-worker executor so tokenization never queues behind
+        # MM preprocessing; must stay single-worker per #38418 (P0/P1 order).
+        self._mm_executor: Executor = ThreadPoolExecutor(max_workers=1)
+```
 
 `copies = renderer_num_workers + 1`：线程池 N 个 worker 并发 encode，再加一份给可能的同步路径。池空时 `deepcopy` 兜底，正确但不免费。
 
@@ -468,6 +538,28 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 - `delta=True`：只返回自上次调用以来的新字符（SSE 用这个）
 - `delta=False`：返回目前全部 `output_text`（可能扣掉 stop 缓冲）
 - 未 finished 时会按最长 stop 串留 `stop_buffer_length` 个字符，避免把半截 stop 流出去
+
+### Slow 路径（`tokenizers < 0.22` 或 slow tokenizer）
+
+Fast 不可用时退回 `SlowIncrementalDetokenizer`：经典 prefix / read offset（来自 TGI）。prompt **只转末尾约 7 个 token** 成字符串（`INITIAL_INCREMENTAL_DETOKENIZATION_OFFSET = 5` 再多 2 个 special）：
+
+```176:268:third_party/vllm/vllm/tokenizers/detokenizer_utils.py
+def detokenize_incrementally(...):
+    ...
+    prefix_text = tokenizer.convert_tokens_to_string(
+        output_tokens[prefix_offset:read_offset]
+    )
+    new_text = tokenizer.convert_tokens_to_string(output_tokens[prefix_offset:])
+    if len(new_text) <= len(prefix_text) or new_text.endswith("�"):
+        return new_tokens, "", prefix_offset, read_offset
+    new_text = new_text[len(prefix_text) :]
+```
+
+offset 是为了对付 SentencePiece / BPE「周围 token 决定要不要加空格」。若新文本变短，或结尾是 `�`（未完成的 UTF-8 byte fallback），这次不吐字，等下一个 token。
+
+Slow 会把 prompt ids 也放进 `token_ids`，`output_token_ids` 再切掉 prompt 部分。Fast 只累积生成 ids。
+
+Stop string 在 `update()` 里、decode 之后做字符串匹配：投机解码一次追加多个 token 时，选 **最先完成** 的 stop（并列按 stop 列表顺序），保证和逐 token 追加结果一致。`min_tokens` 之内不检查 stop。engine 已经因 EOS 停了、且不要把 stop token 写进输出时：最后一个 token 先不 decode，再补回 `token_ids`。
 
 ---
 
@@ -663,8 +755,9 @@ VLLM_USE_FASTOKENS=1 vllm serve Qwen/Qwen3-8B
 
 1. 一次 Chat Completions 请求里，Jinja 和 BPE 分别在哪一层、默认是否 `tokenize=True` 一次完成？
 2. 为什么 serving 必须 CachedTokenizer + deepcopy pool，而不是「共用一个 HF tokenizer」？
-3. `Already borrowed` 是哪一层的 bug，vLLM 怎么绕开？
-4. `skip_tokenizer_init` 之后还能调 `/v1/chat/completions` 传 messages 吗？
-5. `DELTA` + `stream_interval=10` 时，客户端几个 token 才看到一段文本？`FINAL_ONLY` 还会跑 DecodeStream 吗？
-6. `VLLM_USE_FASTOKENS=1` 换的是哪一块 Rust，和 `--tokenizer-mode` 是什么关系？
-)
+3. `Already borrowed` 是哪一层的 bug，vLLM 怎么绕开？`_executor` 和 `_mm_executor` 各防什么？
+4. 为什么 chat 默认 `add_special_tokens=False`、completion 默认 `True`？`truncation_side` 为什么不交给 HF tokenizer 自己切？
+5. `skip_tokenizer_init` 之后还能调 `/v1/chat/completions` 传 messages 吗？
+6. `DELTA` + `stream_interval=10` 时，客户端几个 token 才看到一段文本？`FINAL_ONLY` 还会跑 DecodeStream 吗？
+7. Fast / Slow detokenizer 各自怎么处理「当前 token 会改写前一个 token 的空格」？
+8. `VLLM_USE_FASTOKENS=1` 换的是哪一块 Rust，和 `--tokenizer-mode` 是什么关系？
