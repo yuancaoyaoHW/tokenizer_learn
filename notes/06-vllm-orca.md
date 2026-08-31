@@ -282,7 +282,7 @@ endpoint-load-metrics: JSON {"named_metrics": {"kv_cache_usage_perc": 0.4, "num_
 
 - **只覆盖非流式。** `StreamingResponse` 没传 `headers=`，SSE 拿不到这个头。`/v1/chat/completions/batch` 连 `metrics_header` 都没调。生产里最常用的流式路径反而没有反压信号。
 - **读的是全局 `REGISTRY`，不是 `/metrics` 的多进程聚合 registry。** 多 API server（`api_server_count > 1`，且设置了 `PROMETHEUS_MULTIPROC_DIR`）时，头里是**当前进程**自己 `record()` 进去的那份；`/metrics` 走 `get_prometheus_registry()`，口径可以不一致。
-- **labels 被丢弃。** `get_metrics_snapshot` 对每个 sample 生成一个带 `labels` 的 `Gauge`。DP 下同名指标会有多条。ORCA 侧只取 `(name, value)`：TEXT 会输出重复的 `named_metrics.kv_cache_usage_perc=`；JSON 用 dict 推导，后者覆盖前者。等于隐式取了某个 engine 的值，不是聚合值。LoggingStatLogger 那边倒是会把各 engine 的 `kv_cache_usage` **求平均**（`loggers.py` `aggregate_scheduler_stats`），ORCA 没有走那条路。
+- **labels 被丢弃。** `get_metrics_snapshot` 对每个 sample 生成一个带 `labels` 的 `Gauge`。DP 下同名指标会有多条。ORCA 侧只取 `(name, value)`：TEXT 会输出重复的 `named_metrics.kv_cache_usage_perc=`；JSON 用 dict 推导，后者覆盖前者。等于隐式取了某个 engine 的值，不是聚合值。`AggregatedLoggingStatLogger`（`aggregate_engine_logging=True`）会把各 engine 的 `kv_cache_usage` **求平均**（`loggers.py` `aggregate_scheduler_stats`），ORCA 没有走那条路。
 - **每请求一次全量 `REGISTRY.collect()`**，成功时还打一条 `logger.info`（`orca_metrics.py:68`）。`collect()` 会遍历所有 vLLM 指标（含 histogram 桶展开）。这是默认关闭、靠 header 逐请求开启的原因。
 - **格式非法静默降级。** 不是 `text`/`json`（大小写不敏感）只 warning 然后 `None`，客户端拿不到头也不会 4xx。顺带：warning 传的是内置函数 `format` 而不是 `metrics_format`，日志会打成 `<built-in function format>`。
 
