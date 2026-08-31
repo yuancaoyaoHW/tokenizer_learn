@@ -63,7 +63,7 @@ flowchart TD
 vLLM 近年把 tokenizer 从「engine 里直接 encode」收成三层：
 
 - **Renderer**：模板、工具、多模态 placeholder、tokenize（API 进程，线程池）
-- **EngineCore**：只吃 `prompt_token_ids`（GPU 进程）
+- **EngineCore**：只吃 `prompt_token_ids`（GPU 进程；ids 怎么过 ZMQ 见 [08-vllm-enginecore-zmq.md](08-vllm-enginecore-zmq.md)）
 - **OutputProcessor**：增量 detokenize + 按 `output_kind` 组 chunk（API 进程）
 
 Tokenizer 对象本身只做 encode / decode / `apply_chat_template`。真正把一次请求串起来的是 Renderer 和 Detokenizer：
@@ -292,7 +292,7 @@ def parse_dec_only_prompt(prompt: PromptType | object) -> DecoderOnlyDictPrompt:
         )
 ```
 
-HTTP 热路径已经先 `render_chat_async`，所以 `AsyncLLM.add_request` 看到的是带 `type` 的 EngineInput，走同步 `process_inputs`（不再堵 event loop）：
+HTTP 热路径已经先 `render_chat_async`，所以 `AsyncLLM.add_request` 看到的是带 `type` 的 EngineInput，走同步 `process_inputs`（不再堵 event loop）。打包完的 `EngineCoreRequest` 怎么过 ZMQ、主线程为什么不碰 socket，见 [08-vllm-enginecore-zmq.md](08-vllm-enginecore-zmq.md)。
 
 ```355:375:third_party/vllm/vllm/v1/engine/async_llm.py
             if isinstance(prompt, dict) and "type" in prompt:
@@ -620,7 +620,7 @@ DELTA 时文本取增量：
         text = self.detokenizer.get_next_output_text(finished, delta)
 ```
 
-后台 `output_handler` 从 EngineCore 拉 ids，推进 detokenizer，把 `RequestOutput` 推进每个请求的 queue；`generate()` 再 yield 给 serving 层：
+后台 `output_handler` 从 EngineCore 拉 ids，推进 detokenizer，把 `RequestOutput` 推进每个请求的 queue；`generate()` 再 yield 给 serving 层。分块 + `sleep(0)`、stop string 反向 ABORT，见 [08-vllm-enginecore-zmq.md](08-vllm-enginecore-zmq.md) 跳 7。
 
 ```666:708:third_party/vllm/vllm/v1/engine/async_llm.py
         async def output_handler():
@@ -767,3 +767,7 @@ VLLM_USE_FASTOKENS=1 vllm serve Qwen/Qwen3-8B
 ## 旁路：ORCA 反压头（不经过 tokenizer）
 
 非流式 Chat / Completions 在 `JSONResponse` 上可按请求头 `endpoint-load-metrics-format` 附带 KV cache 占用和排队数。写的是 `PrometheusStatLogger` 的 Gauge，读的是进程内 `REGISTRY`，**不经过** Renderer / Detokenizer。流式 SSE 没有这个头。展开见 [06-vllm-orca.md](06-vllm-orca.md)。
+
+## 旁路：EngineCore 的 ZMQ 边界（不经过 tokenizer）
+
+`InputProcessor` 交出的是已经 tokenize 好的 `EngineCoreRequest`。过河结构体里没有字符串 prompt / 生成文本；EngineCore 只吐 `new_token_ids`。七跳拆解（ROUTER/DEALER、IO 线程预处理、buffer 池、前端分块 detok）见 [08-vllm-enginecore-zmq.md](08-vllm-enginecore-zmq.md)。

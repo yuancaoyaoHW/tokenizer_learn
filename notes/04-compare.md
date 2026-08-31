@@ -5,7 +5,7 @@
 - `third_party/vllm` @ `2c7d7dd64a2eaba0feedf42cab2f527486d7479c`
 - `third_party/sglang` @ `e635577431cbdfb8ce5fafb0fcd8a4ac074062c6`
 
-调用链细节分别在 [02-vllm.md](02-vllm.md) / [03-sglang.md](03-sglang.md)。本篇只比 **隔离模型**：线程池 vs 多进程、同进程 `DecodeStream` vs 独立 detokenizer、chat template 落点、skip 通路、fastokens 开关，以及何种负载下哪种模型更合适。启动时怎么选出 tokenizer 类、请求怎么进 encode，见 [07-tokenizer-dispatch.md](07-tokenizer-dispatch.md)。
+调用链细节分别在 [02-vllm.md](02-vllm.md) / [03-sglang.md](03-sglang.md)。本篇只比 **隔离模型**：线程池 vs 多进程、同进程 `DecodeStream` vs 独立 detokenizer、chat template 落点、skip 通路、fastokens 开关，以及何种负载下哪种模型更合适。启动时怎么选出 tokenizer 类、请求怎么进 encode，见 [07-tokenizer-dispatch.md](07-tokenizer-dispatch.md)。vLLM 的 ids 怎么跨 ZMQ 进 EngineCore，见 [08-vllm-enginecore-zmq.md](08-vllm-enginecore-zmq.md)。
 
 **不发明数字。** 下面的「谁赢」是机制推演（GIL、IPC 跳数、能否扩核），不是端到端 QPS 表。要测的指标见后续 `notes/05-performance.md`。
 
@@ -62,7 +62,7 @@ class MPClient(EngineCoreClient):
         new EngineCoreRequests and returning EngineCoreOutputs
 ```
 
-不要把 EngineCore 子进程当成 tokenizer 隔离。vLLM 的 tokenizer / detokenizer **仍在 API 进程**。
+不要把 EngineCore 子进程当成 tokenizer 隔离。vLLM 的 tokenizer / detokenizer **仍在 API 进程**。这条河上有哪些帧、主线程为什么不碰 socket，见 [08-vllm-enginecore-zmq.md](08-vllm-enginecore-zmq.md)。
 
 **SGLang**
 
@@ -183,7 +183,7 @@ def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
 | 默认 | 1 个线程 + 若干 tokenizer 副本，与 HTTP 同进程 | 1 个 TokenizerManager，与 HTTP 同进程 |
 | 扩 encode | 加线程 + 深拷贝 | 加 **进程**（整条 HTTP+Tokenizer） |
 | 为什么复制 | Rust `RefCell` / `Already borrowed` | 进程间不能共享 Rust 对象；顺便绕开 GIL |
-| IPC | encode 结果只作为 ids 进 EngineCore（一跳） | encode 结果 ZMQ 进 Scheduler（一跳）；多 worker 再加 Router |
+| IPC | encode 结果只作为 ids 进 EngineCore（一跳；帧布局见 [08](08-vllm-enginecore-zmq.md)） | encode 结果 ZMQ 进 Scheduler（一跳）；多 worker 再加 Router |
 | 多模态预处理 | 独立 `_mm_executor`，**固定 1 线程** | `mm_processor` 活在 TokenizerManager；多 worker 就有多份 processor |
 
 ---

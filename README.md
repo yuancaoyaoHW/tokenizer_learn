@@ -68,7 +68,10 @@ tokenizer/
 
 第 1 周已经读过的交叉点：Renderer 线程池与三段式见 00 §1 / §7；副本池与 `Already borrowed` 见 01 §6。
 
-旁路（不挡第 2 周主线）：非流式响应可通过 `endpoint-load-metrics` 把头上的 KV cache / 排队数交给上游 LB，见 [notes/06-vllm-orca.md](notes/06-vllm-orca.md)。
+旁路（不挡第 2 周主线）：
+
+- 非流式响应可通过 `endpoint-load-metrics` 把头上的 KV cache / 排队数交给上游 LB，见 [notes/06-vllm-orca.md](notes/06-vllm-orca.md)
+- `EngineCoreRequest` 怎么跨越 ZMQ、EngineCore 主线程为什么不碰 socket，见 [notes/08-vllm-enginecore-zmq.md](notes/08-vllm-enginecore-zmq.md)
 
 ### 第 3 周 — SGLang 调用链与对比
 
@@ -102,6 +105,7 @@ tokenizer/
 | [notes/05-performance.md](notes/05-performance.md) | 已写 | 指标、瓶颈、怎么跑到最好 |
 | [notes/06-vllm-orca.md](notes/06-vllm-orca.md) | 已写 | vLLM ORCA 反压：`endpoint-load-metrics` 写/读链路与边界 |
 | [notes/07-tokenizer-dispatch.md](notes/07-tokenizer-dispatch.md) | 已写 | 启动期选 tokenizer / 运行期进 encode：vLLM 注册表 vs SGLang 探测链 |
+| [notes/08-vllm-enginecore-zmq.md](notes/08-vllm-enginecore-zmq.md) | 已写 | vLLM V1 进程边界：`EngineCoreRequest` 如何跨越 ZMQ |
 
 ---
 
