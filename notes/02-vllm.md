@@ -356,7 +356,7 @@ def cached_tokenizer_from_config(model_config, **kwargs):
     return cached_get_tokenizer(...)
 ```
 
-`get_tokenizer` 解析 mode（`auto` → mistral 探测 → 否则 `hf`），可选打上 fastokens patch，再 `CachedHfTokenizer.from_pretrained`：
+`get_tokenizer` 解析 mode（`auto` → mistral 探测 → 否则 `hf`），可选打上 fastokens patch，再 `CachedHfTokenizer.from_pretrained`。mode 表、v5 `TokenizersBackend` 黑名单、和 SGLang 探测链的对照见 [07-tokenizer-dispatch.md](07-tokenizer-dispatch.md)。
 
 ```186:264:third_party/vllm/vllm/tokenizers/registry.py
 def get_tokenizer(...) -> _T:

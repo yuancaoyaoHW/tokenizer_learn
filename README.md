@@ -72,6 +72,7 @@ tokenizer/
 
 - [notes/03-sglang.md](notes/03-sglang.md)：`TokenizerManager` / `DetokenizerManager` / `--tokenizer-worker-num` / `--tokenizer-backend`
 - [notes/04-compare.md](notes/04-compare.md)：线程池 vs 多进程、同进程 `DecodeStream` vs 独立 detokenizer 进程、chat template 落点
+- [notes/07-tokenizer-dispatch.md](notes/07-tokenizer-dispatch.md)：启动期选 tokenizer 实现（注册表 vs 探测链）/ 运行期怎么进 encode
 
 源码入口：
 
@@ -97,6 +98,7 @@ tokenizer/
 | [notes/03-sglang.md](notes/03-sglang.md) | 已写 | TokenizerManager / DetokenizerManager / 多 worker IPC |
 | [notes/04-compare.md](notes/04-compare.md) | 已写 | vLLM vs SGLang |
 | [notes/05-performance.md](notes/05-performance.md) | 已写 | 指标、瓶颈、怎么跑到最好 |
+| [notes/07-tokenizer-dispatch.md](notes/07-tokenizer-dispatch.md) | 已写 | 启动期选 tokenizer / 运行期进 encode：vLLM 注册表 vs SGLang 探测链 |
 
 ---
 
