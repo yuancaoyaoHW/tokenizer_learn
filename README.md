@@ -68,6 +68,8 @@ tokenizer/
 
 第 1 周已经读过的交叉点：Renderer 线程池与三段式见 00 §1 / §7；副本池与 `Already borrowed` 见 01 §6。
 
+旁路（不挡第 2 周主线）：非流式响应可通过 `endpoint-load-metrics` 把头上的 KV cache / 排队数交给上游 LB，见 [notes/06-vllm-orca.md](notes/06-vllm-orca.md)。
+
 ### 第 3 周 — SGLang 调用链与对比
 
 - [notes/03-sglang.md](notes/03-sglang.md)：`TokenizerManager` / `DetokenizerManager` / `--tokenizer-worker-num` / `--tokenizer-backend`
@@ -97,6 +99,7 @@ tokenizer/
 | [notes/03-sglang.md](notes/03-sglang.md) | 已写 | TokenizerManager / DetokenizerManager / 多 worker IPC |
 | [notes/04-compare.md](notes/04-compare.md) | 已写 | vLLM vs SGLang |
 | [notes/05-performance.md](notes/05-performance.md) | 已写 | 指标、瓶颈、怎么跑到最好 |
+| [notes/06-vllm-orca.md](notes/06-vllm-orca.md) | 已写 | vLLM ORCA 反压：`endpoint-load-metrics` 写/读链路与边界 |
 
 ---
 

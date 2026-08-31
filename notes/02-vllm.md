@@ -761,3 +761,9 @@ VLLM_USE_FASTOKENS=1 vllm serve Qwen/Qwen3-8B
 6. `DELTA` + `stream_interval=10` 时，客户端几个 token 才看到一段文本？`FINAL_ONLY` 还会跑 DecodeStream 吗？
 7. Fast / Slow detokenizer 各自怎么处理「当前 token 会改写前一个 token 的空格」？
 8. `VLLM_USE_FASTOKENS=1` 换的是哪一块 Rust，和 `--tokenizer-mode` 是什么关系？
+
+---
+
+## 旁路：ORCA 反压头（不经过 tokenizer）
+
+非流式 Chat / Completions 在 `JSONResponse` 上可按请求头 `endpoint-load-metrics-format` 附带 KV cache 占用和排队数。写的是 `PrometheusStatLogger` 的 Gauge，读的是进程内 `REGISTRY`，**不经过** Renderer / Detokenizer。流式 SSE 没有这个头。展开见 [06-vllm-orca.md](06-vllm-orca.md)。
